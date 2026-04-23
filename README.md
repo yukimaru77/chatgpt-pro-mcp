@@ -94,6 +94,27 @@ Deep Researchの呼び出しは正当に10〜30分以上かかることがあり
 
 サブエージェントの総実行時間には別途の上限はありません。
 
+### Claude Code のバージョン制限（サブエージェントから `deep_researcher` を呼ぶ場合）
+
+**Claude Code ≤ v2.1.112** が必要です。v2.1.113 でハードコードされた「サブエージェント10分無出力でkill」のwatchdogが導入されており、環境変数や設定では無効化できません。Deep Research は通常10〜60分以上かかるため、このwatchdogがサブエージェントを先に殺してしまいます。
+
+ダウングレード:
+
+```bash
+curl -fsSL https://claude.ai/install.sh | bash -s 2.1.112
+```
+
+自動アップデートを止めるには `~/.claude/settings.json` に以下を追加:
+
+```json
+{ "env": { "DISABLE_AUTOUPDATER": "1" } }
+```
+
+以下のケースではこの制限は適用されません:
+
+- `deep_thinker` のみ使う場合（通常10分以内で完了）
+- メインセッションやテストスクリプトから直接 `deep_researcher` を呼ぶ場合
+
 ## 会話ログ
 
 成功した呼び出しはすべてカレントディレクトリ配下にアーカイブされます:
