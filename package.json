@@ -1,0 +1,39 @@
+{
+  "name": "claude-chatgpt-mcp",
+  "version": "5.0.0",
+  "main": "dist/index.js",
+  "type": "module",
+  "description": "An MCP server that lets Claude (or any MCP client) ask ChatGPT Pro — with web search or Deep Research — via a logged-in Chrome attached over CDP by playwright-cli.",
+  "license": "MIT",
+  "bin": {
+    "claude-chatgpt-mcp": "dist/index.js"
+  },
+  "keywords": [
+    "mcp",
+    "claude",
+    "chatgpt",
+    "playwright"
+  ],
+  "scripts": {
+    "dev": "bun run index.ts",
+    "build": "tsc",
+    "prepare": "npm run build",
+    "start": "node dist/index.js",
+    "test:parallel": "node scripts/mcp_test.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.5.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/node": "^22.13.4",
+    "typescript": "^5.4.2"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}
