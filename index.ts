@@ -140,7 +140,8 @@ async function ensureAttached(): Promise<void> {
 		}
 	} catch {}
 	log(`attaching to Chrome via CDP`);
-	await pw(["attach", "--cdp=chrome"], 60_000);
+	const cdpTarget = process.env.CHATGPT_MCP_CDP || "chrome";
+	await pw(["attach", `--cdp=${cdpTarget}`], 60_000);
 	attached = true;
 }
 
@@ -205,7 +206,7 @@ async function waitForLocked(
 
 async function isProChipPresent(): Promise<boolean> {
 	return (await pwEval<boolean>(
-		`() => !!document.querySelector('form[data-type="unified-composer"] button[aria-label*="Pro"]')`,
+		`() => { const btns = document.querySelectorAll('form[data-type="unified-composer"] button[aria-haspopup="menu"]'); return Array.from(btns).some(b => /Pro/.test(b.innerText || '')); }`,
 	)) === true;
 }
 
@@ -272,7 +273,7 @@ async function selectProModel(): Promise<void> {
 		try {
 			await execCliRaw([
 				"click",
-				"getByTestId('model-switcher-dropdown-button')",
+				`locator('form[data-type="unified-composer"] button[aria-haspopup="menu"]:not([data-testid])').last()`,
 			]);
 			await sleep(400);
 			await execCliRaw([
