@@ -1,0 +1,18 @@
+defaults:
+  model: pro
+  # project: paper_translation
+
+parallelLimits:
+  thinking: 5
+  pro: 3
+  deep_research: 3
+
+projects:
+  paper_translation:
+    label: 論文翻訳プロジェクト
+  graph_vlm:
+    label: グラフVLM研究
+  sota_app:
+    label: 論文SoTA表示アプリ
+  3d:
+    label: 3dプロジェクト

@@ -49,9 +49,10 @@ async function main() {
 	const results = await Promise.allSettled(
 		prompts.map(async (prompt) => {
 			const toolName = process.env.MCP_TOOL || "deep_thinker";
+			const model = process.env.MCP_MODEL;
 			const result = await client.callTool({
 				name: toolName,
-				arguments: { prompt },
+				arguments: model ? { prompt, model } : { prompt },
 			}, undefined, {
 				timeout: REQUEST_TIMEOUT_MS,
 				maxTotalTimeout: REQUEST_TIMEOUT_MS,
