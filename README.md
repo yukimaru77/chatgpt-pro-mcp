@@ -1,6 +1,54 @@
 # chatgpt-pro-mcp
 
+> ### 🟦 `macos-camofox` ブランチについて
+>
+> このブランチは **Chrome + playwright-cli の CDP アタッチ** を捨て、
+> **[Camoufox](https://github.com/camoufox/camoufox-browser) + camofox-mcp の HTTP API** (`http://127.0.0.1:9377`)
+> 経由で ChatGPT を操作する macOS 向けポートです。同一マシンで camofox-mcp を
+> セットアップ済み (`yukimaru77/camofox-mcp@macos-support` を参照) で、その
+> Camoufox プロファイルに ChatGPT Pro へログイン済みなら、本サーバーは
+> その既存セッションをそのまま使い回します — Chrome を別途起動する必要は
+> ありません。
+>
+> #### Mac 向けセットアップ手順 (要約)
+>
+> 1. camofox-mcp の macOS launcher で Camoufox が `:9377` で動いていること
+>    (`yukimaru77/camofox-mcp` リポジトリの `macos-support` ブランチ参照)。
+> 2. Camoufox で `https://chatgpt.com/` を開いてログイン済みであること。
+> 3. このリポジトリで `npm install && npm run build`。
+> 4. Claude Code への登録例 (user スコープ):
+>    ```bash
+>    claude mcp add chatgpt -s user \
+>      -e CAMOFOX_URL=http://127.0.0.1:9377 \
+>      -e CAMOFOX_API_KEY=<同じ camofox-browser の API key> \
+>      -- node /absolute/path/to/chatgpt-pro-mcp/dist/index.js
+>    ```
+>    `CAMOFOX_API_KEY` は camofox-browser を起動した時に渡したものと一致
+>    していなければなりません。設定していなければ空でも可 (loopback 専用)。
+>
+> #### このブランチで利用する環境変数
+>
+> | 変数 | デフォルト | 用途 |
+> |---|---|---|
+> | `CAMOFOX_URL` | `http://127.0.0.1:9377` | camofox-browser のエンドポイント |
+> | `CAMOFOX_API_KEY` | (空) | camofox-browser の Bearer トークン |
+> | `CHATGPT_MCP_USER_ID` | `default` | camofox-browser 上の userId (プロファイル切替に使う) |
+> | `CHATGPT_MCP_SESSION_KEY` | `chatgpt-pro-mcp-<pid>` | camofox-browser 上の sessionKey |
+>
+> #### 既知の上流制約 — ChatGPT UI セレクタ
+>
+> 本サーバーは ChatGPT の DOM セレクタ
+> (`data-testid="model-switcher-dropdown-button"`, `menuitemradio "ウェブ検索"`,
+> `data-testid="send-button"` など) に強く依存します。これは upstream README が
+> 警告している通り **OpenAI 側の UI 変更で随時壊れます**。本ブランチの動作確認時
+> (2026-05) には `model-switcher-dropdown-button` test-id が消えていたため、
+> selector 側の追従更新が別途必要です (Camoufox port 自体は機能しています)。
+>
+> ---
+
 MCPクライアント（Claude Code / Claude Desktop / 任意のMCPホスト）から、ログイン済みのChromeブラウザ経由で **ChatGPT Pro** に質問できるMCPサーバーです。Chromeへの接続は [`playwright-cli`](https://www.npmjs.com/package/@playwright/cli) のCDPアタッチ機能を利用しています。
+
+> **NOTE (`macos-camofox` ブランチ)**: 以下「Chromeへの接続は playwright-cli の…」以降は **main ブランチ向け** の説明です。本ブランチは Chrome ではなく Camoufox を使うため、ブラウザ接続周りは上記「Mac 向けセットアップ手順」を優先してください。それ以外 (ツール仕様、ログ仕様、タイムアウト、サブエージェント制限など) は main と同じです。
 
 各呼び出しごとに新しいChatGPTタブを開き、Proモデルを選択し、指定されたツール（**ウェブ検索** または **Deep Research**）を有効化し、プロンプトを送信し、回答を待って、タブを閉じ、テキストを返します。複数の同時呼び出しはそれぞれ別のタブで動作するため、サブエージェントが並列に作業を展開できます。
 
