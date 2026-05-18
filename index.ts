@@ -149,6 +149,39 @@ async function refreshTab(tabId: string): Promise<void> {
 	});
 }
 
+// Click via JS-dispatched pointer events. ChatGPT uses Radix-style menus
+// that listen for pointerdown/pointerup, not just plain `click`. Playwright's
+// locator.click() works on most pages but here its actionability check
+// ("waiting for element to be visible, enabled and stable") times out on
+// the composer chrome which is continuously re-rendering, and camofox-
+// browser's built-in mouse-sequence fallback never triggers because it
+// matches the error message against lowercase "timeout" while Playwright
+// emits uppercase "Timeout 5000ms exceeded". This dispatch avoids both.
+async function clickViaHttp(tabId: string, selector: string): Promise<void> {
+	const code = `(() => {
+  const el = document.querySelector(${JSON.stringify(selector)});
+  if (!el) throw new Error('clickViaHttp: selector not found: ' + ${JSON.stringify(selector)});
+  el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+  const r = el.getBoundingClientRect();
+  const opts = {
+    bubbles: true, cancelable: true,
+    button: 0, buttons: 1, pointerType: 'mouse',
+    clientX: r.x + r.width / 2,
+    clientY: r.y + r.height / 2,
+  };
+  el.dispatchEvent(new PointerEvent('pointerover', opts));
+  el.dispatchEvent(new PointerEvent('pointerenter', opts));
+  el.dispatchEvent(new PointerEvent('pointerdown', opts));
+  el.dispatchEvent(new MouseEvent('mousedown', opts));
+  el.focus?.();
+  el.dispatchEvent(new PointerEvent('pointerup', opts));
+  el.dispatchEvent(new MouseEvent('mouseup', opts));
+  el.dispatchEvent(new MouseEvent('click', opts));
+  return true;
+})()`;
+	await evalInTab<boolean>(tabId, code);
+}
+
 // Evaluate JS inside the page. Camofox's /evaluate-extended runs the
 // expression via Playwright's page.evaluate(string), which treats the
 // argument as a *bare expression*, not as a function to invoke. So
@@ -248,20 +281,31 @@ async function waitForLocked(
 
 // ----------------------------------------------------------------------------
 // Model & composer-chip toggles
-// - Pro モデルへ切り替え: dropdown → Pro 行
-// - Web 検索 / Deep Research: + ボタン → 該当 menuitemradio
 //
-// camofox-browser に Playwright の getByRole/getByTestId は無いので、対応する
-// クリックを全部 JS 内で `.click()` する形に直してある (page context で同じ
-// イベント (pointer)を発火させるため、ターゲット要素の dispatchEvent ではなく
-// HTMLElement.click() を直接呼ぶ)。
+// Current ChatGPT composer UI (Pro user, observed 2026-05):
+//   - Model selector is a "pill" button inside the composer form:
+//       <button class="__composer-pill"> with text "Thinking" by default.
+//     Clicking it opens a Radix menu of [role=menuitemradio] including:
+//       "Instant" / "Thinking• Standard" / "Pro• Standard" / etc.
+//     After picking Pro the pill text becomes "Pro" (no aria-label).
+//   - The + button (`data-testid="composer-plus-btn"`) opens a menu whose
+//     [role=menuitemradio] items are "Web search" / "Deep research" / etc.
+//     After enabling one, a new __composer-pill appears with
+//     aria-label "<Name>, click to remove".
+//
+// IMPORTANT: opening these Radix menus requires a real pointer event (the
+// upstream README warned about this — calling HTMLElement.click() from a
+// page-context expression does NOT open them under React/Radix). So the
+// opener click goes through camofox-browser's /click endpoint (Playwright
+// click); the row click can still be done from inside an evaluate since at
+// that point the menu items are mounted in the DOM.
 // ----------------------------------------------------------------------------
 
 async function isProChipPresent(tabId: string): Promise<boolean> {
 	return (
 		(await evalInTab<boolean>(
 			tabId,
-			`() => !!document.querySelector('form[data-type="unified-composer"] button[aria-label*="Pro"]')`,
+			`() => [...document.querySelectorAll('form[data-type="unified-composer"] button.__composer-pill')].some(b => /^Pro\\b/.test((b.textContent || '').trim()))`,
 		)) === true
 	);
 }
@@ -270,7 +314,7 @@ async function isWebSearchChipPresent(tabId: string): Promise<boolean> {
 	return (
 		(await evalInTab<boolean>(
 			tabId,
-			`() => !!document.querySelector('form[data-type="unified-composer"] button[aria-label^="検索"]')`,
+			`() => !!document.querySelector('form[data-type="unified-composer"] button.__composer-pill[aria-label^="Search"], form[data-type="unified-composer"] button.__composer-pill[aria-label^="検索"]')`,
 		)) === true
 	);
 }
@@ -279,36 +323,9 @@ async function isDeepResearchChipPresent(tabId: string): Promise<boolean> {
 	return (
 		(await evalInTab<boolean>(
 			tabId,
-			`() => !!document.querySelector('form[data-type="unified-composer"] button[aria-label^="Deep Research" i], form[data-type="unified-composer"] button[aria-label^="ディープリサーチ" i]')`,
+			`() => !!document.querySelector('form[data-type="unified-composer"] button.__composer-pill[aria-label^="Deep research" i], form[data-type="unified-composer"] button.__composer-pill[aria-label^="ディープリサーチ" i]')`,
 		)) === true
 	);
-}
-
-// Click a menu/menuitemradio item by visible name. We pop the + menu (or
-// model dropdown), then look up the item by aria-label/text and click it.
-// Returns true if the click landed; false if the item wasn't found.
-async function clickMenuItemByName(
-	tabId: string,
-	openerSelector: string,
-	itemNameSubstring: string,
-): Promise<boolean> {
-	const code = `async () => {
-  const opener = document.querySelector(${JSON.stringify(openerSelector)});
-  if (!opener) throw new Error('opener not found: ' + ${JSON.stringify(openerSelector)});
-  opener.click();
-  await new Promise(r => setTimeout(r, 500));
-  const items = [...document.querySelectorAll('[role="menuitemradio"], [role="menuitem"]')];
-  const needle = ${JSON.stringify(itemNameSubstring)};
-  for (const el of items) {
-    const name = (el.getAttribute('aria-label') || el.textContent || '').trim();
-    if (name.includes(needle)) {
-      el.click();
-      return true;
-    }
-  }
-  return false;
-}`;
-	return (await evalInTab<boolean>(tabId, code)) === true;
 }
 
 async function pressEscape(tabId: string): Promise<void> {
@@ -320,10 +337,33 @@ async function pressEscape(tabId: string): Promise<void> {
 	} catch {}
 }
 
+// Click an already-mounted menu item by its visible text or aria-label.
+// The menu must already be open (use clickViaHttp for the opener first).
+async function clickMenuItemByText(
+	tabId: string,
+	patterns: string[],
+): Promise<boolean> {
+	const code = `(() => {
+  const patterns = ${JSON.stringify(patterns)};
+  const items = [...document.querySelectorAll('[role="menuitemradio"], [role="menuitem"]')];
+  for (const el of items) {
+    const name = ((el.getAttribute('aria-label') || el.textContent) || '').trim();
+    for (const p of patterns) {
+      if (name.includes(p) || new RegExp(p, 'i').test(name)) {
+        el.click();
+        return true;
+      }
+    }
+  }
+  return false;
+})()`;
+	return (await evalInTab<boolean>(tabId, code)) === true;
+}
+
 async function enableComposerTool(
 	tabId: string,
 	openerSelector: string,
-	itemName: string,
+	itemPatterns: string[],
 	verify: () => Promise<boolean>,
 	label: string,
 ): Promise<void> {
@@ -333,9 +373,11 @@ async function enableComposerTool(
 	}
 	for (let attempt = 1; attempt <= 3; attempt++) {
 		try {
-			const clicked = await clickMenuItemByName(tabId, openerSelector, itemName);
-			if (!clicked) log(`${label} item "${itemName}" not in menu (attempt ${attempt})`);
-			await sleep(400);
+			await clickViaHttp(tabId, openerSelector);
+			await sleep(500);
+			const clicked = await clickMenuItemByText(tabId, itemPatterns);
+			if (!clicked) log(`${label} item ${JSON.stringify(itemPatterns)} not in menu (attempt ${attempt})`);
+			await sleep(500);
 			if (await verify()) {
 				log(`enable ${label} verified (attempt=${attempt})`);
 				return;
@@ -353,23 +395,18 @@ async function enableComposerTool(
 }
 
 async function selectProModel(tabId: string): Promise<void> {
+	if (await isProChipPresent(tabId)) {
+		log(`Pro chip already present — skip model select`);
+		return;
+	}
 	for (let attempt = 1; attempt <= 3; attempt++) {
 		try {
-			const code = `async () => {
-  const opener = document.querySelector('[data-testid="model-switcher-dropdown-button"]');
-  if (!opener) throw new Error('model-switcher-dropdown-button not found');
-  opener.click();
-  await new Promise(r => setTimeout(r, 500));
-  const items = [...document.querySelectorAll('[role="menuitemradio"]')];
-  for (const el of items) {
-    const name = (el.getAttribute('aria-label') || el.textContent || '').trim();
-    if (/^Pro/.test(name)) { el.click(); return true; }
-  }
-  return false;
-}`;
-			const clicked = await evalInTab<boolean>(tabId, code);
+			// Open the model-pill menu via real Playwright click.
+			await clickViaHttp(tabId, `form[data-type="unified-composer"] button.__composer-pill`);
+			await sleep(500);
+			const clicked = await clickMenuItemByText(tabId, ["^Pro"]);
 			if (!clicked) log(`Pro row not found (attempt ${attempt})`);
-			await sleep(400);
+			await sleep(500);
 			if (await isProChipPresent(tabId)) {
 				log(`selectProModel verified (attempt=${attempt})`);
 				return;
@@ -390,7 +427,7 @@ async function enableWebSearchChip(tabId: string): Promise<void> {
 	await enableComposerTool(
 		tabId,
 		`[data-testid="composer-plus-btn"]`,
-		"ウェブ検索",
+		["Web search", "ウェブ検索"],
 		() => isWebSearchChipPresent(tabId),
 		"web-search",
 	);
@@ -400,7 +437,7 @@ async function enableDeepResearchChip(tabId: string): Promise<void> {
 	await enableComposerTool(
 		tabId,
 		`[data-testid="composer-plus-btn"]`,
-		"Deep research",
+		["Deep research", "ディープリサーチ"],
 		() => isDeepResearchChipPresent(tabId),
 		"deep-research",
 	);
@@ -468,14 +505,9 @@ async function setupNewChatAndSend(
 			5_000,
 			"send button available",
 		);
-		await evalVoid(
-			tabId,
-			`() => {
-  const b = document.querySelector('button[data-testid="send-button"]');
-  if (!b) throw new Error('send button missing');
-  b.click();
-}`,
-		);
+		// Use pointer-event dispatch like the menu openers — React onMouseDown
+		// handlers on the send button do not always fire from a bare .click().
+		await clickViaHttp(tabId, `button[data-testid="send-button"]`);
 
 		// Wait for the URL to settle on /c/<id>.
 		let url = "";
@@ -518,22 +550,32 @@ function cleanDeepResearchText(raw: string): string {
 	return cleaned.trim();
 }
 
+// Extract the /c/<id> identifier from a ChatGPT conversation URL, so we
+// can compare two URLs as "same conversation" even when ChatGPT appends
+// a model query string or fragment after the navigation we observed.
+function conversationId(url: string): string | null {
+	const m = url.match(/\/c\/([0-9a-f-]+)/i);
+	return m ? m[1] : null;
+}
+
 async function probeConversation(
 	tabId: string,
 	convUrl: string,
 ): Promise<CompletionProbe | null> {
 	return cliMutex(async () => {
-		// Make sure the tab still exists and is on the expected URL. If it
-		// moved (user navigated away in the visible window, etc.) we treat
-		// it as gone.
+		// Make sure the tab still exists and is on the same /c/<id> page
+		// (ChatGPT may append `?model=...` or a hash after navigation; treat
+		// those as the same conversation).
 		let live: string;
 		try {
-			live = await evalInTab<string>(tabId, `() => location.href`);
+			live = await evalInTab<string>(tabId, `location.href`);
 		} catch (e) {
 			vlog(`probe location.href failed for ${tabId}: ${(e as Error).message}`);
 			return null;
 		}
-		if (live !== convUrl) {
+		const expected = conversationId(convUrl);
+		const actual = conversationId(live);
+		if (!actual || actual !== expected) {
 			vlog(`tab ${tabId} url drifted: ${live} != ${convUrl}`);
 			return null;
 		}
