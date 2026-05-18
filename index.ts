@@ -201,14 +201,24 @@ function wrapForEvaluate(expr: string): string {
 	return trimmed;
 }
 
-async function evalInTab<T>(tabId: string, expression: string): Promise<T> {
+// Evaluate JS in the page (frameUrl unset) or in a specific frame whose
+// URL contains `frameUrl` (string substring or /pattern/flags regex).
+// Frame routing requires camofox-browser's patch-camofox-frame-evaluate
+// patch — without it, frameUrl is ignored.
+async function evalInTab<T>(
+	tabId: string,
+	expression: string,
+	frameUrl?: string,
+): Promise<T> {
+	const body: Record<string, unknown> = {
+		userId: CAMOFOX_USER_ID,
+		expression: wrapForEvaluate(expression),
+	};
+	if (frameUrl) body.frameUrl = frameUrl;
 	const res = await http(
 		"POST",
 		`/tabs/${encodeURIComponent(tabId)}/evaluate-extended`,
-		{
-			userId: CAMOFOX_USER_ID,
-			expression: wrapForEvaluate(expression),
-		},
+		body,
 	);
 	if (res && res.ok === false) {
 		throw new Error(`evaluate failed: ${res.error || JSON.stringify(res)}`);
@@ -543,10 +553,18 @@ type CompletionProbe = {
 };
 
 function cleanDeepResearchText(raw: string): string {
+	// Strip the digit-counter animation noise (0\n1\n...9\n repeated).
 	let cleaned = raw.replace(/(?:\d\s*\n){5,}/g, "");
-	const marker = "件の検索";
-	const idx = cleaned.lastIndexOf(marker);
-	if (idx >= 0) cleaned = cleaned.slice(idx + marker.length);
+	// Strip the header line(s) before the report body. Locale-dependent:
+	// "件の検索" (ja-JP) or " searches\n" (en-US). Prefer the last occurrence,
+	// which sits right before the report title.
+	for (const marker of ["件の検索", " searches\n", " searches"]) {
+		const idx = cleaned.lastIndexOf(marker);
+		if (idx >= 0) {
+			cleaned = cleaned.slice(idx + marker.length);
+			break;
+		}
+	}
 	return cleaned.trim();
 }
 
@@ -558,25 +576,43 @@ function conversationId(url: string): string | null {
 	return m ? m[1] : null;
 }
 
+// Tab existence/URL check that does NOT use evaluate (so it survives a
+// page that's busy rendering Deep Research and rejects evaluate calls).
+// Returns the *current* URL of the tab, or null if the tab is gone.
+async function tabUrl(tabId: string): Promise<string | null> {
+	try {
+		const res = await http(
+			"GET",
+			`/tabs?userId=${encodeURIComponent(CAMOFOX_USER_ID)}`,
+			undefined,
+			5_000,
+		);
+		const tabs = (res?.tabs || []) as Array<{ tabId: string; url: string }>;
+		const hit = tabs.find((t) => t.tabId === tabId);
+		return hit ? hit.url : null;
+	} catch {
+		return null;
+	}
+}
+
 async function probeConversation(
 	tabId: string,
 	convUrl: string,
 ): Promise<CompletionProbe | null> {
 	return cliMutex(async () => {
-		// Make sure the tab still exists and is on the same /c/<id> page
-		// (ChatGPT may append `?model=...` or a hash after navigation; treat
-		// those as the same conversation).
-		let live: string;
-		try {
-			live = await evalInTab<string>(tabId, `location.href`);
-		} catch (e) {
-			vlog(`probe location.href failed for ${tabId}: ${(e as Error).message}`);
+		// Existence check first via GET /tabs (does not run a page.evaluate, so
+		// it survives a Deep Research page that's CPU-bound and refusing eval
+		// calls — that previously tripped "tab disappeared" after a few
+		// consecutive eval timeouts even though the tab was genuinely alive).
+		const liveUrl = await tabUrl(tabId);
+		if (!liveUrl) {
+			vlog(`tab ${tabId} is gone (not in /tabs listing)`);
 			return null;
 		}
 		const expected = conversationId(convUrl);
-		const actual = conversationId(live);
+		const actual = conversationId(liveUrl);
 		if (!actual || actual !== expected) {
-			vlog(`tab ${tabId} url drifted: ${live} != ${convUrl}`);
+			vlog(`tab ${tabId} url drifted: ${liveUrl} != ${convUrl}`);
 			return null;
 		}
 
@@ -622,9 +658,16 @@ async function probeConversation(
 }`,
 		);
 
-		// Deep Research body lives inside a same-origin about:blank iframe
-		// (name="root"). Since it's same-origin we reach in from the page
-		// context via contentDocument — no need for Playwright's frame API.
+		// Deep Research body lives in a two-level iframe stack:
+		//   outer:  <iframe title="internal://deep-research"
+		//                   src="https://...oaiusercontent.com/?app=chatgpt">  (cross-origin)
+		//     └── inner: <iframe id="root" src="about:blank">                 (same-origin
+		//                                                                      with the outer)
+		// Page-context JS can't read the outer iframe (different origin). We
+		// route through Playwright's frame API via camofox-browser's
+		// frame-evaluate patch: ask camofox to evaluate inside the outer
+		// frame, and from THERE walk into root#contentDocument (same-origin
+		// from the outer's perspective).
 		let drText = "";
 		let drDone = false;
 		let drFigures: Figure[] = [];
@@ -638,14 +681,19 @@ async function probeConversation(
 				}>(
 					tabId,
 					`() => {
-  const iframes = [...document.querySelectorAll('iframe')];
-  const root = iframes.find(f => f.name === 'root' || (f.src === '' || f.src === 'about:blank'));
+  const root = document.getElementById('root');
   if (!root) return { text: '', done: false, figures: [], reason: 'no-root-iframe' };
   let doc;
-  try { doc = root.contentDocument; } catch (e) { return { text: '', done: false, figures: [], reason: 'cross-origin' }; }
-  const body = doc?.body;
+  try { doc = root.contentDocument; } catch (e) { return { text: '', done: false, figures: [], reason: 'cross-origin: ' + e.message }; }
+  if (!doc) return { text: '', done: false, figures: [], reason: 'no-contentDocument' };
+  const body = doc.body;
   const text = body ? (body.innerText || '') : '';
-  const done = /リサーチが完了しました/.test(text) || /research\\s*complete/i.test(text);
+  // ChatGPT signals completion with one of these markers depending on locale.
+  // "Research completed in" appears in en-US, "リサーチが完了" in ja-JP, and
+  // "件の検索" comes from the search-counter region right above the report.
+  const done = /Research completed in/i.test(text)
+            || /リサーチが完了/.test(text)
+            || /research\\s*complete/i.test(text);
   const figures = [];
   if (body) {
     body.querySelectorAll('svg').forEach(svg => {
@@ -665,6 +713,7 @@ async function probeConversation(
   }
   return { text, done, figures };
 }`,
+					"oaiusercontent.com",
 				);
 				drText = info.text || "";
 				drDone = info.done || false;
