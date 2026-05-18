@@ -6,18 +6,26 @@ import {
 	ListToolsRequestSchema,
 	type Tool,
 } from "@modelcontextprotocol/sdk/types.js";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import * as path from "node:path";
-
-const execFileP = promisify(execFile);
 
 // ----------------------------------------------------------------------------
 // Config
 // ----------------------------------------------------------------------------
+//
+// macOS port: this server no longer drives Chrome via playwright-cli + CDP.
+// Instead it speaks the camofox-browser HTTP API (`camofox-mcp` fork's
+// browser server) at $CAMOFOX_URL. That backend wraps Camoufox (Firefox)
+// with anti-detection, and importantly the user's ChatGPT-Pro login is
+// persisted in Camoufox's profile dir — so this MCP reuses the same logged-
+// in session that camofox-mcp already uses. See docs/macos.md.
 
-const CLI = process.env.CHATGPT_MCP_PW_CLI || "playwright-cli";
+const CAMOFOX_URL = (process.env.CAMOFOX_URL || "http://127.0.0.1:9377").replace(/\/$/, "");
+const CAMOFOX_API_KEY = process.env.CAMOFOX_API_KEY || "";
+const CAMOFOX_USER_ID = process.env.CHATGPT_MCP_USER_ID || "default";
+const CAMOFOX_SESSION_KEY =
+	process.env.CHATGPT_MCP_SESSION_KEY || `chatgpt-pro-mcp-${process.pid}`;
+
 const LOG_FILE = process.env.CHATGPT_MCP_LOG || "/tmp/chatgpt-mcp.log";
 const VERBOSE = process.env.CHATGPT_MCP_VERBOSE === "1";
 const MAX_WAIT_THINKER_MS =
@@ -27,8 +35,7 @@ const MAX_WAIT_RESEARCHER_MS =
 const COMPOSER_WAIT_MS = 30_000;
 const URL_WAIT_MS = 30_000;
 const POLL_INTERVAL_MS = 2_000;
-const CLI_TIMEOUT_MS = 45_000;
-const CLI_MAX_BUFFER = 20 * 1024 * 1024;
+const EVAL_TIMEOUT_MS = 45_000;
 
 // ----------------------------------------------------------------------------
 // Logging
@@ -47,9 +54,8 @@ const vlog = (msg: string) => {
 };
 
 // ----------------------------------------------------------------------------
-// Mutex. cliMutex は CLI サブプロセス同士の直列化、sessionMutex は
-// 「タブ特定→操作」を原子的に束ねるための大粒度ロック。
-// setup フェーズは sessionMutex で単一化。poll フェーズは各iterで cliMutex だけ取る。
+// Mutex. cliMutex は browser-driver 操作の直列化。setup フェーズはこの
+// 範囲で原子化される; poll は各 iter で短時間取るだけ。
 // ----------------------------------------------------------------------------
 
 function makeMutex() {
@@ -60,113 +66,158 @@ function makeMutex() {
 		return next;
 	};
 }
-// すべての playwright-cli 操作を1本の Promise chain で直列化する。
-// setup は大きなブロックを cliMutex で独占、poll の各iter も同じ cliMutex を
-// 短時間取る。これで setup 中に poll の tab-select が割り込むのを防ぐ。
 const cliMutex = makeMutex();
 
 // ----------------------------------------------------------------------------
-// playwright-cli subprocess primitives
+// camofox-browser HTTP driver
 // ----------------------------------------------------------------------------
 
-async function execCliRaw(args: string[], timeout = CLI_TIMEOUT_MS): Promise<string> {
+function authHeaders(): Record<string, string> {
+	const h: Record<string, string> = { "Content-Type": "application/json" };
+	if (CAMOFOX_API_KEY) h["Authorization"] = `Bearer ${CAMOFOX_API_KEY}`;
+	return h;
+}
+
+async function http(
+	method: "GET" | "POST" | "DELETE",
+	pathname: string,
+	body?: unknown,
+	timeoutMs = EVAL_TIMEOUT_MS,
+): Promise<any> {
+	const url = `${CAMOFOX_URL}${pathname}`;
+	const ac = new AbortController();
+	const timer = setTimeout(() => ac.abort(), timeoutMs);
 	try {
-		const { stdout } = await execFileP(CLI, args, {
-			timeout,
-			maxBuffer: CLI_MAX_BUFFER,
-			encoding: "utf8",
+		const res = await fetch(url, {
+			method,
+			headers: authHeaders(),
+			body: body === undefined ? undefined : JSON.stringify(body),
+			signal: ac.signal,
 		});
-		return stdout;
-	} catch (e) {
-		const err = e as NodeJS.ErrnoException & {
-			stderr?: string;
-			stdout?: string;
-		};
-		throw new Error(
-			`pw(${args.join(" ")}) failed: ${err.message}${err.stderr ? " :: " + err.stderr.slice(0, 400) : ""}`,
-		);
-	}
-}
-
-// ロック付き実行(他リクエストとの衝突を防ぐ)。
-async function pw(args: string[], timeout = CLI_TIMEOUT_MS): Promise<string> {
-	return cliMutex(() => execCliRaw(args, timeout));
-}
-
-// eval 結果(JSON)をパース。--raw をつけても余計な出力が混じることがあるので
-// 最後の有効な JSON-like ブロックを取り出す。
-function parsePwOutput(raw: string): string {
-	const trimmed = raw.trim();
-	if (!trimmed) return "";
-	const candidates = [trimmed];
-	const firstBlockEnd = trimmed.indexOf("\n### ");
-	if (firstBlockEnd > 0) candidates.push(trimmed.slice(0, firstBlockEnd).trim());
-	const firstLine = trimmed.split("\n")[0];
-	if (firstLine) candidates.push(firstLine);
-	return candidates[0];
-}
-
-async function pwEvalRaw(expr: string): Promise<string> {
-	const out = await execCliRaw(["--raw", "eval", expr]);
-	return parsePwOutput(out);
-}
-
-async function pwEval<T>(expr: string): Promise<T> {
-	const raw = await pwEvalRaw(expr);
-	try {
-		return JSON.parse(raw) as T;
-	} catch {
-		return raw as unknown as T;
-	}
-}
-
-async function pwEvalVoid(expr: string): Promise<void> {
-	await pwEvalRaw(expr);
-}
-
-// ----------------------------------------------------------------------------
-// Chrome attach lifecycle
-// ----------------------------------------------------------------------------
-
-let attached = false;
-async function ensureAttached(): Promise<void> {
-	if (attached) return;
-	try {
-		const list = await pw(["list"]);
-		if (list.includes("default")) {
-			attached = true;
-			log(`already attached to Chrome`);
-			return;
+		const text = await res.text();
+		let parsed: any = text;
+		if (text) {
+			try {
+				parsed = JSON.parse(text);
+			} catch {}
 		}
-	} catch {}
-	log(`attaching to Chrome via CDP`);
-	await pw(["attach", "--cdp=chrome"], 60_000);
-	attached = true;
-}
-
-// ----------------------------------------------------------------------------
-// Tab listing
-// ----------------------------------------------------------------------------
-
-type TabInfo = { index: number; current: boolean; title: string; url: string };
-
-function parseTabList(raw: string): TabInfo[] {
-	const tabs: TabInfo[] = [];
-	for (const line of raw.split("\n")) {
-		const m = line.match(/^- (\d+):\s*(\(current\))?\s*\[(.*?)\]\((.*?)\)\s*$/);
-		if (m)
-			tabs.push({
-				index: Number(m[1]),
-				current: !!m[2],
-				title: m[3],
-				url: m[4],
-			});
+		if (!res.ok) {
+			const errMsg =
+				(parsed && typeof parsed === "object" && (parsed.error || parsed.message)) ||
+				text ||
+				`HTTP ${res.status}`;
+			throw new Error(`camofox ${method} ${pathname} -> ${res.status}: ${errMsg}`);
+		}
+		return parsed;
+	} finally {
+		clearTimeout(timer);
 	}
-	return tabs;
 }
 
-async function tabListLocked(): Promise<TabInfo[]> {
-	return parseTabList(await execCliRaw(["--raw", "tab-list"]));
+type CamoTab = { tabId: string; url: string; createdAt?: string };
+
+// camofox-browser's GET /tabs returns { running, tabs: [...] }
+async function listTabsLocked(): Promise<CamoTab[]> {
+	const res = await http(
+		"GET",
+		`/tabs?userId=${encodeURIComponent(CAMOFOX_USER_ID)}`,
+	);
+	const tabs = (res?.tabs || []) as Array<{ tabId: string; url: string; createdAt?: string }>;
+	return tabs.map((t) => ({ tabId: t.tabId, url: t.url, createdAt: t.createdAt }));
+}
+
+async function createTab(url: string): Promise<string> {
+	const res = await http("POST", "/tabs", {
+		userId: CAMOFOX_USER_ID,
+		sessionKey: CAMOFOX_SESSION_KEY,
+		url,
+	});
+	if (!res?.tabId) throw new Error(`create_tab returned no tabId: ${JSON.stringify(res)}`);
+	return String(res.tabId);
+}
+
+async function closeTab(tabId: string): Promise<void> {
+	await http(
+		"DELETE",
+		`/tabs/${encodeURIComponent(tabId)}?userId=${encodeURIComponent(CAMOFOX_USER_ID)}`,
+	);
+}
+
+async function refreshTab(tabId: string): Promise<void> {
+	await http("POST", `/tabs/${encodeURIComponent(tabId)}/refresh`, {
+		userId: CAMOFOX_USER_ID,
+	});
+}
+
+// Evaluate JS inside the page. Camofox's /evaluate-extended runs the
+// expression via Playwright's page.evaluate(string), which treats the
+// argument as a *bare expression*, not as a function to invoke. So
+// `() => 1` evaluates to a function value (returned as undefined). We
+// auto-wrap anything that looks like a function definition with `(...)()`
+// so existing `() => ...` and `async () => ...` callsites keep working.
+function wrapForEvaluate(expr: string): string {
+	const trimmed = expr.trim();
+	if (
+		trimmed.startsWith("() =>") ||
+		trimmed.startsWith("async () =>") ||
+		trimmed.startsWith("function") ||
+		trimmed.startsWith("async function")
+	) {
+		return `(${trimmed})()`;
+	}
+	return trimmed;
+}
+
+async function evalInTab<T>(tabId: string, expression: string): Promise<T> {
+	const res = await http(
+		"POST",
+		`/tabs/${encodeURIComponent(tabId)}/evaluate-extended`,
+		{
+			userId: CAMOFOX_USER_ID,
+			expression: wrapForEvaluate(expression),
+		},
+	);
+	if (res && res.ok === false) {
+		throw new Error(`evaluate failed: ${res.error || JSON.stringify(res)}`);
+	}
+	return res?.result as T;
+}
+
+async function evalVoid(tabId: string, expression: string): Promise<void> {
+	await evalInTab(tabId, expression);
+}
+
+// ----------------------------------------------------------------------------
+// Tab tracking by URL. Some helpers need to find "the tab whose location is
+// the conversation URL" since the chatgpt-pro flow keys each request by
+// /c/<id>. The Camoufox HTTP listing only reports the URL the tab was
+// *created* at, not the current location, so for safety we look up by
+// querying the live `location.href` of each tab via evaluate.
+// ----------------------------------------------------------------------------
+
+async function findTabIdByLocation(targetUrl: string): Promise<string | null> {
+	const tabs = await listTabsLocked();
+	for (const t of tabs) {
+		try {
+			const live = await evalInTab<string>(t.tabId, `() => location.href`);
+			if (live === targetUrl) return t.tabId;
+		} catch (e) {
+			vlog(`findTabIdByLocation(${t.tabId}) skipped: ${(e as Error).message}`);
+		}
+	}
+	return null;
+}
+
+// ----------------------------------------------------------------------------
+// Driver health check (camofox-browser must be reachable; the underlying
+// browser may start on demand when the first tab is created).
+// ----------------------------------------------------------------------------
+
+async function ensureDriverReady(): Promise<void> {
+	const res = await http("GET", "/health", undefined, 5_000);
+	if (!res || res.ok === false || res.running === false) {
+		throw new Error(`camofox-browser at ${CAMOFOX_URL} not ready: ${JSON.stringify(res)}`);
+	}
 }
 
 // ----------------------------------------------------------------------------
@@ -197,33 +248,81 @@ async function waitForLocked(
 
 // ----------------------------------------------------------------------------
 // Model & composer-chip toggles
-// - モデル: dropdown → Pro を選ぶ
-// - Web検索: + ボタン → ウェブ検索 を押す(タブごとにトグル必要)
-// どちらも playwright-cli の click (getByRole/getByTestId) を使う。JS .click()
-// では React の pointer event ハンドラが拾わない場合があるため。
+// - Pro モデルへ切り替え: dropdown → Pro 行
+// - Web 検索 / Deep Research: + ボタン → 該当 menuitemradio
+//
+// camofox-browser に Playwright の getByRole/getByTestId は無いので、対応する
+// クリックを全部 JS 内で `.click()` する形に直してある (page context で同じ
+// イベント (pointer)を発火させるため、ターゲット要素の dispatchEvent ではなく
+// HTMLElement.click() を直接呼ぶ)。
 // ----------------------------------------------------------------------------
 
-async function isProChipPresent(): Promise<boolean> {
-	return (await pwEval<boolean>(
-		`() => !!document.querySelector('form[data-type="unified-composer"] button[aria-label*="Pro"]')`,
-	)) === true;
+async function isProChipPresent(tabId: string): Promise<boolean> {
+	return (
+		(await evalInTab<boolean>(
+			tabId,
+			`() => !!document.querySelector('form[data-type="unified-composer"] button[aria-label*="Pro"]')`,
+		)) === true
+	);
 }
 
-async function isWebSearchChipPresent(): Promise<boolean> {
-	return (await pwEval<boolean>(
-		`() => !!document.querySelector('form[data-type="unified-composer"] button[aria-label^="検索"]')`,
-	)) === true;
+async function isWebSearchChipPresent(tabId: string): Promise<boolean> {
+	return (
+		(await evalInTab<boolean>(
+			tabId,
+			`() => !!document.querySelector('form[data-type="unified-composer"] button[aria-label^="検索"]')`,
+		)) === true
+	);
 }
 
-async function isDeepResearchChipPresent(): Promise<boolean> {
-	// aria-label は "Deep Research：クリックして削除" (大文字R)。念のため大小両対応。
-	return (await pwEval<boolean>(
-		`() => !!document.querySelector('form[data-type="unified-composer"] button[aria-label^="Deep Research" i], form[data-type="unified-composer"] button[aria-label^="ディープリサーチ" i]')`,
-	)) === true;
+async function isDeepResearchChipPresent(tabId: string): Promise<boolean> {
+	return (
+		(await evalInTab<boolean>(
+			tabId,
+			`() => !!document.querySelector('form[data-type="unified-composer"] button[aria-label^="Deep Research" i], form[data-type="unified-composer"] button[aria-label^="ディープリサーチ" i]')`,
+		)) === true
+	);
 }
 
-// 汎用: +メニューから menuitemradio を 1 つ選択する。
+// Click a menu/menuitemradio item by visible name. We pop the + menu (or
+// model dropdown), then look up the item by aria-label/text and click it.
+// Returns true if the click landed; false if the item wasn't found.
+async function clickMenuItemByName(
+	tabId: string,
+	openerSelector: string,
+	itemNameSubstring: string,
+): Promise<boolean> {
+	const code = `async () => {
+  const opener = document.querySelector(${JSON.stringify(openerSelector)});
+  if (!opener) throw new Error('opener not found: ' + ${JSON.stringify(openerSelector)});
+  opener.click();
+  await new Promise(r => setTimeout(r, 500));
+  const items = [...document.querySelectorAll('[role="menuitemradio"], [role="menuitem"]')];
+  const needle = ${JSON.stringify(itemNameSubstring)};
+  for (const el of items) {
+    const name = (el.getAttribute('aria-label') || el.textContent || '').trim();
+    if (name.includes(needle)) {
+      el.click();
+      return true;
+    }
+  }
+  return false;
+}`;
+	return (await evalInTab<boolean>(tabId, code)) === true;
+}
+
+async function pressEscape(tabId: string): Promise<void> {
+	try {
+		await http("POST", `/tabs/${encodeURIComponent(tabId)}/press`, {
+			userId: CAMOFOX_USER_ID,
+			key: "Escape",
+		});
+	} catch {}
+}
+
 async function enableComposerTool(
+	tabId: string,
+	openerSelector: string,
 	itemName: string,
 	verify: () => Promise<boolean>,
 	label: string,
@@ -232,90 +331,83 @@ async function enableComposerTool(
 		log(`${label} chip already present — skip enable`);
 		return;
 	}
-	let attempt = 0;
-	while (attempt < 3) {
-		attempt++;
+	for (let attempt = 1; attempt <= 3; attempt++) {
 		try {
-			await execCliRaw(["click", "getByTestId('composer-plus-btn')"]);
-			await sleep(500);
-			await execCliRaw([
-				"click",
-				`getByRole('menuitemradio', { name: ${JSON.stringify(itemName)} })`,
-			]);
+			const clicked = await clickMenuItemByName(tabId, openerSelector, itemName);
+			if (!clicked) log(`${label} item "${itemName}" not in menu (attempt ${attempt})`);
 			await sleep(400);
 			if (await verify()) {
 				log(`enable ${label} verified (attempt=${attempt})`);
 				return;
 			}
 			log(`⚠️ ${label} chip not present after attempt ${attempt}`);
-			try {
-				await execCliRaw(["press", "Escape"]);
-			} catch {}
+			await pressEscape(tabId);
 			await sleep(300);
 		} catch (e) {
 			log(`enable ${label} attempt ${attempt} failed: ${(e as Error).message}`);
-			try {
-				await execCliRaw(["press", "Escape"]);
-			} catch {}
+			await pressEscape(tabId);
 			await sleep(300);
 		}
 	}
 	throw new Error(`Could not enable ${label} chip after 3 attempts`);
 }
 
-// ウェブ検索/DeepResearchと同じく毎回明示的にドロップダウン→Pro を踏む。
-// 「既に Pro っぽい」早期リターンはしない。
-async function selectProModel(): Promise<void> {
-	let attempt = 0;
-	while (attempt < 3) {
-		attempt++;
+async function selectProModel(tabId: string): Promise<void> {
+	for (let attempt = 1; attempt <= 3; attempt++) {
 		try {
-			await execCliRaw([
-				"click",
-				"getByTestId('model-switcher-dropdown-button')",
-			]);
+			const code = `async () => {
+  const opener = document.querySelector('[data-testid="model-switcher-dropdown-button"]');
+  if (!opener) throw new Error('model-switcher-dropdown-button not found');
+  opener.click();
+  await new Promise(r => setTimeout(r, 500));
+  const items = [...document.querySelectorAll('[role="menuitemradio"]')];
+  for (const el of items) {
+    const name = (el.getAttribute('aria-label') || el.textContent || '').trim();
+    if (/^Pro/.test(name)) { el.click(); return true; }
+  }
+  return false;
+}`;
+			const clicked = await evalInTab<boolean>(tabId, code);
+			if (!clicked) log(`Pro row not found (attempt ${attempt})`);
 			await sleep(400);
-			await execCliRaw([
-				"click",
-				"getByRole('menuitemradio', { name: /^Pro/ })",
-			]);
-			await sleep(400);
-			const ok = await isProChipPresent();
-			if (ok) {
+			if (await isProChipPresent(tabId)) {
 				log(`selectProModel verified (attempt=${attempt})`);
 				return;
 			}
 			log(`⚠️ Pro chip not present after attempt ${attempt}`);
-			try {
-				await execCliRaw(["press", "Escape"]);
-			} catch {}
+			await pressEscape(tabId);
 			await sleep(300);
 		} catch (e) {
 			log(`selectProModel attempt ${attempt} failed: ${(e as Error).message}`);
-			try {
-				await execCliRaw(["press", "Escape"]);
-			} catch {}
+			await pressEscape(tabId);
 			await sleep(300);
 		}
 	}
 	throw new Error(`Could not select Pro model after 3 attempts`);
 }
 
-async function enableWebSearchChip(): Promise<void> {
-	await enableComposerTool("ウェブ検索", isWebSearchChipPresent, "web-search");
+async function enableWebSearchChip(tabId: string): Promise<void> {
+	await enableComposerTool(
+		tabId,
+		`[data-testid="composer-plus-btn"]`,
+		"ウェブ検索",
+		() => isWebSearchChipPresent(tabId),
+		"web-search",
+	);
 }
 
-async function enableDeepResearchChip(): Promise<void> {
+async function enableDeepResearchChip(tabId: string): Promise<void> {
 	await enableComposerTool(
+		tabId,
+		`[data-testid="composer-plus-btn"]`,
 		"Deep research",
-		isDeepResearchChipPresent,
+		() => isDeepResearchChipPresent(tabId),
 		"deep-research",
 	);
 }
 
 // ----------------------------------------------------------------------------
 // Setup: open tab → send prompt → acquire conversation URL
-// sessionMutex で一括 = この間は他リクエストの tab-new/select と干渉しない。
 // ----------------------------------------------------------------------------
 
 type ChipMode = "web-search" | "deep-research";
@@ -323,77 +415,84 @@ type ChipMode = "web-search" | "deep-research";
 async function setupNewChatAndSend(
 	prompt: string,
 	mode: ChipMode,
-): Promise<string> {
+): Promise<{ convUrl: string; tabId: string }> {
 	return cliMutex(async () => {
-		// 1) 新規タブ(新しいタブが current になる)
-		await execCliRaw(["tab-new", "https://chatgpt.com/"]);
+		const tabId = await createTab("https://chatgpt.com/");
 
-		// 2) composer 出現を待つ
 		await waitForLocked(
 			async () =>
-				(await pwEval<boolean>(
+				(await evalInTab<boolean>(
+					tabId,
 					`() => !!document.querySelector('#prompt-textarea')`,
 				)) === true,
 			COMPOSER_WAIT_MS,
 			"composer ready",
 		);
 
-		// 3) 邪魔なダイアログがあれば閉じる
-		await pwEvalVoid(`() => {
+		// Dismiss any blocking dialog (Pro upgrade prompts, etc.).
+		await evalVoid(
+			tabId,
+			`() => {
   const selectors = ['[role="dialog"] button[aria-label="閉じる"]', '[role="dialog"] button[aria-label="Close"]'];
   for (const s of selectors) document.querySelectorAll(s).forEach(b => b.click());
-}`);
+}`,
+		);
 		await sleep(200);
 
-		// 3.5) モデルを Pro に、ツールチップをモードに応じて有効化
-		await selectProModel();
+		await selectProModel(tabId);
 		if (mode === "web-search") {
-			await enableWebSearchChip();
+			await enableWebSearchChip(tabId);
 		} else {
-			await enableDeepResearchChip();
+			await enableDeepResearchChip(tabId);
 		}
 
-		// 4) プロンプト入力
+		// Insert prompt into the contenteditable composer.
 		const jsonPrompt = JSON.stringify(prompt);
-		await pwEvalVoid(`() => {
+		await evalVoid(
+			tabId,
+			`() => {
   const e = document.querySelector('#prompt-textarea');
   if (!e) throw new Error('composer not found');
   e.focus();
   document.execCommand('insertText', false, ${jsonPrompt});
-}`);
+}`,
+		);
 		await sleep(300);
 
-		// 5) 送信ボタン出現を少し待つ
 		await waitForLocked(
 			async () =>
-				(await pwEval<boolean>(
+				(await evalInTab<boolean>(
+					tabId,
 					`() => !!document.querySelector('button[data-testid="send-button"]')`,
 				)) === true,
 			5_000,
 			"send button available",
 		);
-		await pwEvalVoid(`() => {
+		await evalVoid(
+			tabId,
+			`() => {
   const b = document.querySelector('button[data-testid="send-button"]');
   if (!b) throw new Error('send button missing');
   b.click();
-}`);
+}`,
+		);
 
-		// 6) URL が /c/<id> に切り替わるのを待つ(このタブの識別子)
+		// Wait for the URL to settle on /c/<id>.
 		let url = "";
 		await waitForLocked(
 			async () => {
-				url = await pwEval<string>(`() => location.href`);
+				url = await evalInTab<string>(tabId, `() => location.href`);
 				return /\/c\/[0-9a-f-]+/i.test(url);
 			},
 			URL_WAIT_MS,
 			"conversation URL",
 		);
-		return url;
+		return { convUrl: url, tabId };
 	});
 }
 
 // ----------------------------------------------------------------------------
-// Poll: URL ベースでタブを特定して原子的に select+eval を行う
+// Poll: identify the conversation tab by current URL, then evaluate state.
 // ----------------------------------------------------------------------------
 
 type Figure =
@@ -406,14 +505,11 @@ type CompletionProbe = {
 	stopping: boolean;
 	thinking: boolean;
 	streaming: boolean;
-	deepResearching: boolean; // Deep Research iframe が居てまだ完了してない
+	deepResearching: boolean;
 	text: string;
-	figures: Figure[]; // コンテンツ画像(SVG/IMG/Canvas)
+	figures: Figure[];
 };
 
-// Deep Research の本文は nested iframe (about:blank, name="root") の中。
-// 完了時はその body に "リサーチが完了しました" ヘッダが載る。
-// 頭にカウンタアニメーションのゴミ文字列 (0\n1\n..9\n) が並ぶので除去する。
 function cleanDeepResearchText(raw: string): string {
 	let cleaned = raw.replace(/(?:\d\s*\n){5,}/g, "");
 	const marker = "件の検索";
@@ -422,22 +518,27 @@ function cleanDeepResearchText(raw: string): string {
 	return cleaned.trim();
 }
 
-async function execCliRunCode(code: string): Promise<string> {
-	const out = await execCliRaw(["--raw", "run-code", code]);
-	return parsePwOutput(out);
-}
-
-async function probeConversation(convUrl: string): Promise<CompletionProbe | null> {
+async function probeConversation(
+	tabId: string,
+	convUrl: string,
+): Promise<CompletionProbe | null> {
 	return cliMutex(async () => {
-		const tabs = parseTabList(await execCliRaw(["--raw", "tab-list"]));
-		const found = tabs.find((t) => t.url === convUrl);
-		if (!found) return null;
-		if (!found.current) {
-			await execCliRaw(["tab-select", String(found.index)]);
+		// Make sure the tab still exists and is on the expected URL. If it
+		// moved (user navigated away in the visible window, etc.) we treat
+		// it as gone.
+		let live: string;
+		try {
+			live = await evalInTab<string>(tabId, `() => location.href`);
+		} catch (e) {
+			vlog(`probe location.href failed for ${tabId}: ${(e as Error).message}`);
+			return null;
+		}
+		if (live !== convUrl) {
+			vlog(`tab ${tabId} url drifted: ${live} != ${convUrl}`);
+			return null;
 		}
 
-		// top-level DOM の状態を取る
-		const top = await pwEval<{
+		const top = await evalInTab<{
 			stop: boolean;
 			good: boolean;
 			thinking: boolean;
@@ -445,7 +546,9 @@ async function probeConversation(convUrl: string): Promise<CompletionProbe | nul
 			drIframe: boolean;
 			text: string;
 			figures: Figure[];
-		}>(`() => {
+		}>(
+			tabId,
+			`() => {
   const stop = !!document.querySelector('button[data-testid="stop-button"]');
   const good = !!document.querySelector('button[data-testid="good-response-turn-action-button"]');
   const assistants = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
@@ -474,54 +577,56 @@ async function probeConversation(convUrl: string): Promise<CompletionProbe | nul
     });
   }
   return { stop, good, thinking, streaming, drIframe, text, figures };
-}`);
+}`,
+		);
 
-		// Deep Research モードなら nested iframe を読みに行く
+		// Deep Research body lives inside a same-origin about:blank iframe
+		// (name="root"). Since it's same-origin we reach in from the page
+		// context via contentDocument — no need for Playwright's frame API.
 		let drText = "";
 		let drDone = false;
 		let drFigures: Figure[] = [];
 		if (top.drIframe) {
 			try {
-				const raw = await execCliRunCode(`async (page) => {
-  const frames = page.frames();
-  const rootFrame = frames.find(f => f.name() === 'root' || f.url() === 'about:blank');
-  if (!rootFrame) return { text: '', done: false, figures: [], reason: 'no-root-frame' };
-  try {
-    const info = await rootFrame.evaluate(() => {
-      const body = document.body;
-      const text = body ? (body.innerText || '') : '';
-      const done = /リサーチが完了しました/.test(text) || /research\\s*complete/i.test(text);
-      const figures = [];
-      if (body) {
-        body.querySelectorAll('svg').forEach(svg => {
-          const r = svg.getBoundingClientRect();
-          if (r.width > 100 && r.height > 100) figures.push({ kind: 'svg', content: svg.outerHTML });
-        });
-        body.querySelectorAll('img').forEach(img => {
-          const r = img.getBoundingClientRect();
-          if (r.width > 50 && r.height > 50 && img.src) figures.push({ kind: 'img', src: img.src, alt: img.alt || '' });
-        });
-        body.querySelectorAll('canvas').forEach(c => {
-          const r = c.getBoundingClientRect();
-          if (r.width > 100 && r.height > 100) {
-            try { figures.push({ kind: 'canvas', dataURL: c.toDataURL('image/png') }); } catch (e) {}
-          }
-        });
-      }
-      return { text, done, figures };
-    });
-    return info;
-  } catch (e) { return { text: '', done: false, figures: [], reason: String(e) }; }
-}`);
-				const parsed = JSON.parse(raw) as {
+				const info = await evalInTab<{
 					text: string;
 					done: boolean;
 					figures: Figure[];
 					reason?: string;
-				};
-				drText = parsed.text || "";
-				drDone = parsed.done || false;
-				drFigures = parsed.figures || [];
+				}>(
+					tabId,
+					`() => {
+  const iframes = [...document.querySelectorAll('iframe')];
+  const root = iframes.find(f => f.name === 'root' || (f.src === '' || f.src === 'about:blank'));
+  if (!root) return { text: '', done: false, figures: [], reason: 'no-root-iframe' };
+  let doc;
+  try { doc = root.contentDocument; } catch (e) { return { text: '', done: false, figures: [], reason: 'cross-origin' }; }
+  const body = doc?.body;
+  const text = body ? (body.innerText || '') : '';
+  const done = /リサーチが完了しました/.test(text) || /research\\s*complete/i.test(text);
+  const figures = [];
+  if (body) {
+    body.querySelectorAll('svg').forEach(svg => {
+      const r = svg.getBoundingClientRect();
+      if (r.width > 100 && r.height > 100) figures.push({ kind: 'svg', content: svg.outerHTML });
+    });
+    body.querySelectorAll('img').forEach(img => {
+      const r = img.getBoundingClientRect();
+      if (r.width > 50 && r.height > 50 && img.src) figures.push({ kind: 'img', src: img.src, alt: img.alt || '' });
+    });
+    body.querySelectorAll('canvas').forEach(c => {
+      const r = c.getBoundingClientRect();
+      if (r.width > 100 && r.height > 100) {
+        try { figures.push({ kind: 'canvas', dataURL: c.toDataURL('image/png') }); } catch (e) {}
+      }
+    });
+  }
+  return { text, done, figures };
+}`,
+				);
+				drText = info.text || "";
+				drDone = info.done || false;
+				drFigures = info.figures || [];
 			} catch (e) {
 				vlog(`DR iframe probe error: ${(e as Error).message}`);
 			}
@@ -546,24 +651,19 @@ async function probeConversation(convUrl: string): Promise<CompletionProbe | nul
 	});
 }
 
-async function closeConversationTab(convUrl: string): Promise<void> {
+async function closeConversationTab(tabId: string): Promise<void> {
 	return cliMutex(async () => {
-		const tabs = parseTabList(await execCliRaw(["--raw", "tab-list"]));
-		const found = tabs.find((t) => t.url === convUrl);
-		if (!found) return;
-		await execCliRaw(["tab-close", String(found.index)]);
+		try {
+			await closeTab(tabId);
+		} catch (e) {
+			vlog(`closeTab(${tabId}) failed: ${(e as Error).message}`);
+		}
 	});
 }
 
-async function reloadConversationTab(convUrl: string): Promise<void> {
+async function reloadConversationTab(tabId: string): Promise<void> {
 	return cliMutex(async () => {
-		const tabs = parseTabList(await execCliRaw(["--raw", "tab-list"]));
-		const found = tabs.find((t) => t.url === convUrl);
-		if (!found) return;
-		if (!found.current) {
-			await execCliRaw(["tab-select", String(found.index)]);
-		}
-		await execCliRaw(["reload"]);
+		await refreshTab(tabId);
 	});
 }
 
@@ -573,9 +673,6 @@ async function reloadConversationTab(convUrl: string): Promise<void> {
 
 const LOG_DIR_BASE = process.env.CHATGPT_MCP_CONV_LOG_DIR || "chatgpt_log";
 
-// 解決基準: CHATGPT_MCP_CONV_LOG_DIR が絶対パスならそれを使う。
-// 相対パスなら、Claude Code が流してくる $CLAUDE_PROJECT_DIR を優先し、
-// 無ければ process.cwd() にフォールバック。
 function resolveLogRoot(): string {
 	if (path.isAbsolute(LOG_DIR_BASE)) return LOG_DIR_BASE;
 	const base = process.env.CLAUDE_PROJECT_DIR || process.cwd();
@@ -590,10 +687,7 @@ function formatLogTimestamp(d = new Date()): string {
 	);
 }
 
-function inferImageExt(
-	src: string,
-	contentType: string | null,
-): string {
+function inferImageExt(src: string, contentType: string | null): string {
 	const m = src.match(/\.(png|jpe?g|gif|webp|avif|bmp|svg)(\?|#|$)/i);
 	if (m) return m[1].toLowerCase().replace("jpeg", "jpg");
 	if (contentType) {
@@ -606,9 +700,7 @@ function inferImageExt(
 	return "png";
 }
 
-function decodeDataUrl(
-	url: string,
-): { buffer: Buffer; ext: string } | null {
+function decodeDataUrl(url: string): { buffer: Buffer; ext: string } | null {
 	const m = url.match(/^data:([^;,]+)(;base64)?,(.*)$/s);
 	if (!m) return null;
 	const mime = m[1] || "application/octet-stream";
@@ -621,9 +713,7 @@ function decodeDataUrl(
 	return { buffer, ext };
 }
 
-async function fetchRemoteImage(
-	src: string,
-): Promise<{ buffer: Buffer; ext: string } | null> {
+async function fetchRemoteImage(src: string): Promise<{ buffer: Buffer; ext: string } | null> {
 	try {
 		const res = await fetch(src);
 		if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -682,9 +772,7 @@ async function saveConversationLog(
 						links.push(`![${alt}](figures/${fname})`);
 						savedCount++;
 					} else if (fig.kind === "img") {
-						let saved:
-							| { buffer: Buffer; ext: string }
-							| null = null;
+						let saved: { buffer: Buffer; ext: string } | null = null;
 						if (fig.src.startsWith("data:")) {
 							saved = decodeDataUrl(fig.src);
 						} else {
@@ -696,7 +784,6 @@ async function saveConversationLog(
 							links.push(`![${alt}](figures/${fname})`);
 							savedCount++;
 						} else {
-							// フェッチ失敗時は remote URL をそのまま貼る
 							links.push(`![${alt}](${fig.src})`);
 						}
 					}
@@ -724,7 +811,7 @@ async function saveConversationLog(
 // Per-request flow
 // ----------------------------------------------------------------------------
 
-const STALE_RELOAD_AFTER_ITERS = 30; // stallしてるっぽい時にreloadしてみる閾値
+const STALE_RELOAD_AFTER_ITERS = 30;
 
 let nextReqId = 1;
 
@@ -738,13 +825,11 @@ async function handleAsk(
 	const head = prompt.slice(0, 40).replace(/\n/g, " ");
 	log(`#${id} [${mode}] ask START "${head}..."`);
 
-	await ensureAttached();
+	await ensureDriverReady();
 
-	// setup(他リクエストと直列化される)
-	const convUrl = await setupNewChatAndSend(prompt, mode);
-	log(`#${id} [${mode}] conversation url: ${convUrl}`);
+	const { convUrl, tabId } = await setupNewChatAndSend(prompt, mode);
+	log(`#${id} [${mode}] conversation url=${convUrl} tabId=${tabId}`);
 
-	// poll(他リクエストとは並列に進む、各 iter だけ cliMutex を取る)
 	const deadline = Date.now() + maxWaitMs;
 	let iter = 0;
 	let lastTextLen = -1;
@@ -754,7 +839,7 @@ async function handleAsk(
 		iter++;
 		let probe: CompletionProbe | null;
 		try {
-			probe = await probeConversation(convUrl);
+			probe = await probeConversation(tabId, convUrl);
 		} catch (e) {
 			vlog(`#${id} probe error: ${(e as Error).message}`);
 			continue;
@@ -776,20 +861,16 @@ async function handleAsk(
 			);
 		}
 		if (probe.done) {
-			log(
-				`#${id} DONE (${probe.text.length} chars, ${probe.figures.length} figures)`,
-			);
+			log(`#${id} DONE (${probe.text.length} chars, ${probe.figures.length} figures)`);
 			const finalText = probe.text.trim();
 			await saveConversationLog(toolName, prompt, finalText, probe.figures);
 			try {
-				await closeConversationTab(convUrl);
+				await closeConversationTab(tabId);
 			} catch (e) {
 				log(`#${id} close tab failed: ${(e as Error).message}`);
 			}
 			return finalText;
 		}
-		// DOM が反映されてないっぽい場合はリロードで救済
-		// ただし Deep Research iframe が居る間は触らない(リロードで研究が飛ぶ)
 		if (
 			!probe.stopping &&
 			!probe.thinking &&
@@ -801,7 +882,7 @@ async function handleAsk(
 				`#${id} DOM appears stale (iter=${iter} no change for ${noChangeIters} iters) — reloading`,
 			);
 			try {
-				await reloadConversationTab(convUrl);
+				await reloadConversationTab(tabId);
 			} catch (e) {
 				log(`#${id} reload failed: ${(e as Error).message}`);
 			}
@@ -810,7 +891,7 @@ async function handleAsk(
 	}
 
 	try {
-		await closeConversationTab(convUrl);
+		await closeConversationTab(tabId);
 	} catch {}
 	throw new Error(
 		`Timed out after ${Math.round(maxWaitMs / 60000)} minutes for ${convUrl}`,
@@ -830,7 +911,8 @@ const DEEP_THINKER_TOOL: Tool = {
 		properties: {
 			prompt: {
 				type: "string",
-				description: "The question or task to send. Be as specific as possible about what kind of answer you want.",
+				description:
+					"The question or task to send. Be as specific as possible about what kind of answer you want.",
 			},
 		},
 		required: ["prompt"],
@@ -846,7 +928,8 @@ const DEEP_RESEARCHER_TOOL: Tool = {
 		properties: {
 			prompt: {
 				type: "string",
-				description: "A well-scoped research question. State the topic, what you want investigated, and what format the report should take.",
+				description:
+					"A well-scoped research question. State the topic, what you want investigated, and what format the report should take.",
 			},
 		},
 		required: ["prompt"],
@@ -872,12 +955,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
 		let response: string;
 		if (name === "deep_thinker") {
-			response = await handleAsk(
-				prompt,
-				"web-search",
-				MAX_WAIT_THINKER_MS,
-				"deep_thinker",
-			);
+			response = await handleAsk(prompt, "web-search", MAX_WAIT_THINKER_MS, "deep_thinker");
 		} else if (name === "deep_researcher") {
 			response = await handleAsk(
 				prompt,
@@ -914,6 +992,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 const transport = new StdioServerTransport();
 await server.connect(transport);
 log(
-	`server started pid=${process.pid} cli=${CLI} log=${LOG_FILE} cwd=${process.cwd()} conv_log_root=${resolveLogRoot()}`,
+	`server started pid=${process.pid} backend=${CAMOFOX_URL} userId=${CAMOFOX_USER_ID} cwd=${process.cwd()} conv_log_root=${resolveLogRoot()}`,
 );
-console.error("ChatGPT MCP Server (web) running on stdio");
+console.error("ChatGPT MCP Server (Camoufox backend) running on stdio");
