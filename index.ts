@@ -137,10 +137,13 @@ async function createTab(url: string): Promise<string> {
 }
 
 async function closeTab(tabId: string): Promise<void> {
-	await http(
-		"DELETE",
-		`/tabs/${encodeURIComponent(tabId)}?userId=${encodeURIComponent(CAMOFOX_USER_ID)}`,
-	);
+	// camofox-browser's DELETE /tabs/:tabId reads userId from the request
+	// *body*, not the query string. Sending it only via ?userId=... silently
+	// no-ops (the route returns 200 ok but the underlying Playwright page is
+	// never closed), so the conversation tab accumulates forever.
+	await http("DELETE", `/tabs/${encodeURIComponent(tabId)}`, {
+		userId: CAMOFOX_USER_ID,
+	});
 }
 
 async function refreshTab(tabId: string): Promise<void> {
