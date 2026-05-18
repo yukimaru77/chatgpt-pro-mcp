@@ -663,11 +663,17 @@ async function probeConversation(
 		//                   src="https://...oaiusercontent.com/?app=chatgpt">  (cross-origin)
 		//     └── inner: <iframe id="root" src="about:blank">                 (same-origin
 		//                                                                      with the outer)
-		// Page-context JS can't read the outer iframe (different origin). We
-		// route through Playwright's frame API via camofox-browser's
-		// frame-evaluate patch: ask camofox to evaluate inside the outer
-		// frame, and from THERE walk into root#contentDocument (same-origin
-		// from the outer's perspective).
+		// Upstream (Chrome + playwright-cli) reaches the inner frame via
+		// `page.frames().find(f => f.name() === 'root' || f.url() === 'about:blank')`
+		// because Playwright's frame API works across origins. Page-context JS
+		// can't do that on its own — different origins block contentDocument.
+		// camofox-browser's evaluate-extended doesn't expose frames(), so we
+		// added a `frameUrl` parameter (see patch-camofox-frame-evaluate.mjs
+		// in camofox-mcp). With it, this expression runs INSIDE the outer
+		// sandbox frame; from there the inner #root iframe is same-origin
+		// and contentDocument works. The body of that inner frame is the
+		// same DOM Playwright would see through frames(), so we keep the
+		// upstream's body.innerText extraction unchanged.
 		let drText = "";
 		let drDone = false;
 		let drFigures: Figure[] = [];
@@ -688,9 +694,9 @@ async function probeConversation(
   if (!doc) return { text: '', done: false, figures: [], reason: 'no-contentDocument' };
   const body = doc.body;
   const text = body ? (body.innerText || '') : '';
-  // ChatGPT signals completion with one of these markers depending on locale.
-  // "Research completed in" appears in en-US, "リサーチが完了" in ja-JP, and
-  // "件の検索" comes from the search-counter region right above the report.
+  // ChatGPT signals completion with a locale-dependent marker. Upstream
+  // matched "リサーチが完了" / "research complete"; en-US emits
+  // "Research completed in N min".
   const done = /Research completed in/i.test(text)
             || /リサーチが完了/.test(text)
             || /research\\s*complete/i.test(text);
